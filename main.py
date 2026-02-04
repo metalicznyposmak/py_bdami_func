@@ -2,17 +2,17 @@ import os
 import datetime
 import pyodbc
 import jwt
+import bcrypt
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel
-from passlib.context import CryptContext
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from typing import Optional, List
 
 load_dotenv()
 
 app = FastAPI(title="PY_BDAMI_API", root_path="/api")
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 auth_scheme = HTTPBearer()
 
 def get_conn():
@@ -53,6 +53,18 @@ def create_token(user_id: int, username: str) -> str:
     }
     return jwt.encode(payload, secret, algorithm="HS256")
 
+def hash_password(password: str) -> str:
+    pw_bytes = password.encode("utf-8")
+    hashed = bcrypt.hashpw(pw_bytes, bcrypt.gensalt())
+    return hashed.decode("utf-8")
+
+def verify_password(password: str, password_hash: str) -> bool:
+    try:
+        return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
+    except ValueError:
+        # invalid/unknown hash format
+        raise HTTPException(status_code=400, detail="Stored password hash invalid")
+
 def verify_token(creds: HTTPAuthorizationCredentials = Depends(auth_scheme)):
     token = creds.credentials
     secret = os.environ["JWT_SECRET"]
@@ -87,7 +99,10 @@ def register(req: RegisterReq):
     if len(username) < 3 or len(req.password) < 6:
         raise HTTPException(status_code=400, detail="Username/password too short")
 
-    password_hash = pwd_context.hash(req.password)
+    try:
+        password_hash = hash_password(req.password)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Password too long: truncate to 72 bytes")
 
     with get_conn() as conn:
         cur = conn.cursor()
@@ -127,7 +142,9 @@ def login(req: LoginReq):
     if not is_active:
         raise HTTPException(status_code=403, detail="User disabled")
 
-    if not pwd_context.verify(req.password, password_hash):
+    ok = verify_password(req.password, password_hash)
+
+    if not ok:
         raise HTTPException(status_code=401, detail="Bad credentials")
 
     return {"access_token": create_token(user_id, username), "token_type": "bearer"}
@@ -135,3 +152,262 @@ def login(req: LoginReq):
 @app.get("/me")
 def me(payload=Depends(verify_token)):
     return {"user_id": payload["sub"], "username": payload.get("name")}
+
+class CategoryOut(BaseModel):
+    id: int
+    name: str
+
+class ProductOut(BaseModel):
+    id: int
+    categoryId: int
+    name: str
+    description: str
+    price: float
+    imageUrl: Optional[str] = None
+    isActive: bool
+
+class CartItemOut(BaseModel):
+    productId: int
+    name: str
+    quantity: int
+    unitPrice: float
+    lineTotal: float
+
+class CartOut(BaseModel):
+    cartId: int
+    status: str
+    items: List[CartItemOut]
+    total: float
+
+class CartAddReq(BaseModel):
+    productId: int
+    quantity: int = Field(..., ge=1, le=999)
+
+class CartSetReq(BaseModel):
+    productId: int
+    quantity: int = Field(..., ge=1, le=999)
+
+def get_or_create_active_cart_id(user_id: int) -> int:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT TOP 1 id FROM dbo.Carts WHERE userId = ? AND status = 'active' ORDER BY createdAt DESC",
+            user_id
+        )
+        row = cur.fetchone()  
+        if row:
+            return int(row[0])
+        
+        cur.execute(
+            "INSERT INTO dbo.Carts (userId, status) VALUES (?, 'active')",
+            user_id
+        )
+        conn.commit()
+
+        cur.execute(
+            "SELECT TOP 1 id FROM dbo.Carts WHERE userId = ? AND status = 'active' ORDER BY createdAt DESC",
+            user_id
+        )
+        row2 = cur.fetchone()
+        return int(row2[0])
+    
+@app.get("/categories", response_model=list[CategoryOut])
+def list_categories():
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT id, name FROM dbo.Categories ORDER BY name ASC")
+        rows = cur.fetchall()
+
+    return [{"id": r[0], "name": r[1]} for r in rows]
+
+
+@app.get("/products", response_model=list[ProductOut])
+def list_products(categoryId: int | None = None, onlyActive: bool = True):
+    sql = """
+        SELECT id, categoryId, name, description, price, imageUrl, isActive
+        FROM dbo.Products
+    """
+    params = []
+
+    where = []
+    if categoryId is not None:
+        where.append("categoryId = ?")
+        params.append(categoryId)
+    if onlyActive:
+        where.append("isActive = 1")
+
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+
+    sql += " ORDER BY name ASC"
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = cur.fetchall()
+
+    return [
+        {
+            "id": int(r[0]),
+            "categoryId": int(r[1]),
+            "name": r[2],
+            "description": r[3],
+            "price": float(r[4]),
+            "imageUrl": r[5],
+            "isActive": bool(r[6]),
+        }
+        for r in rows
+    ]
+
+
+@app.get("/products/{product_id}", response_model=ProductOut)
+def get_product(product_id: int):
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT id, categoryId, name, description, price, imageUrl, isActive
+               FROM dbo.Products
+               WHERE id = ?""",
+            product_id
+        )
+        r = cur.fetchone()
+
+    if not r:
+        raise HTTPException(status_code=404, detail="Product not found")
+
+    return {
+        "id": int(r[0]),
+        "categoryId": int(r[1]),
+        "name": r[2],
+        "description": r[3],
+        "price": float(r[4]),
+        "imageUrl": r[5],
+        "isActive": bool(r[6]),
+    }
+
+@app.get("/cart", response_model=CartOut)
+def get_cart(payload=Depends(verify_token)):
+    user_id = int(payload["sub"])
+    cart_id = get_or_create_active_cart_id(user_id)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        cur.execute("SELECT id, status FROM dbo.Carts WHERE id = ?", cart_id)
+        cart_row = cur.fetchone()
+        if not cart_row:
+            raise HTTPException(status_code=404, detail="Cart not found")
+
+        cur.execute(
+            """
+            SELECT ci.productId, p.name, ci.quantity, ci.unitPrice
+            FROM dbo.CartItems ci
+            JOIN dbo.Products p ON p.id = ci.productId
+            WHERE ci.cartId = ?
+            ORDER BY p.name ASC
+            """,
+            cart_id
+        )
+        rows = cur.fetchall()
+
+    items = []
+    total = 0.0
+    for r in rows:
+        product_id = int(r[0])
+        name = r[1]
+        qty = int(r[2])
+        unit_price = float(r[3])
+        line_total = unit_price * qty
+        total += line_total
+        items.append({
+            "productId": product_id,
+            "name": name,
+            "quantity": qty,
+            "unitPrice": unit_price,
+            "lineTotal": line_total
+        })
+
+    return {
+        "cartId": int(cart_row[0]),
+        "status": cart_row[1],
+        "items": items,
+        "total": total
+    }
+
+@app.post("/cart/items/add", response_model=CartOut)
+def cart_add_item(req: CartAddReq, payload=Depends(verify_token)):
+    user_id = int(payload["sub"])
+    cart_id = get_or_create_active_cart_id(user_id)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+
+        cur.execute(
+            "SELECT price, isActive FROM dbo.Products WHERE id = ?",
+            req.productId
+        )
+        p = cur.fetchone()
+        if not p:
+            raise HTTPException(status_code=404, detail="Product not found")
+        if not bool(p[1]):
+            raise HTTPException(status_code=400, detail="Product is inactive")
+
+        price = float(p[0])
+
+        cur.execute(
+            "SELECT quantity FROM dbo.CartItems WHERE cartId = ? AND productId = ?",
+            cart_id, req.productId
+        )
+        row = cur.fetchone()
+        if row:
+            new_qty = int(row[0]) + int(req.quantity)
+            cur.execute(
+                "UPDATE dbo.CartItems SET quantity = ? WHERE cartId = ? AND productId = ?",
+                new_qty, cart_id, req.productId
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO dbo.CartItems (cartId, productId, quantity, unitPrice)
+                VALUES (?, ?, ?, ?)
+                """,
+                cart_id, req.productId, req.quantity, price
+            )
+
+        conn.commit()
+
+    return get_cart(payload)
+
+@app.post("/cart/items/set", response_model=CartOut)
+def cart_set_quantity(req: CartSetReq, payload=Depends(verify_token)):
+    user_id = int(payload["sub"])
+    cart_id = get_or_create_active_cart_id(user_id)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE dbo.CartItems SET quantity = ? WHERE cartId = ? AND productId = ?",
+            req.quantity, cart_id, req.productId
+        )
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="Item not found in cart")
+        conn.commit()
+
+    return get_cart(payload)
+
+@app.delete("/cart/items/{product_id}", response_model=CartOut)
+def cart_remove_item(product_id: int, payload=Depends(verify_token)):
+    user_id = int(payload["sub"])
+    cart_id = get_or_create_active_cart_id(user_id)
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM dbo.CartItems WHERE cartId = ? AND productId = ?",
+            cart_id, product_id
+        )
+        conn.commit()
+
+    return get_cart(payload)
+
+
