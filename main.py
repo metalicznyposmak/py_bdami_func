@@ -84,6 +84,9 @@ class RegisterReq(BaseModel):
     username: str
     password: str
 
+class ChangeUsernameReq(BaseModel):
+    new_username: str
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -152,6 +155,32 @@ def login(req: LoginReq):
 @app.get("/me")
 def me(payload=Depends(verify_token)):
     return {"user_id": payload["sub"], "username": payload.get("name")}
+
+@app.put("/me/username")
+def change_username(req: ChangeUsernameReq, payload=Depends(verify_token)):
+    user_id = int(payload["sub"])
+    new_username = req.new_username.strip()
+
+    if len(new_username) < 3:
+        raise HTTPException(status_code=400, detail="Username too short")
+
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM dbo.Users WHERE Username = ? AND Id <> ?", new_username, user_id)
+        if cur.fetchone():
+            raise HTTPException(status_code=409, detail="Username already taken")
+
+        cur.execute("UPDATE dbo.Users SET Username = ? WHERE Id = ?", new_username, user_id)
+        if cur.rowcount == 0:
+            raise HTTPException(status_code=404, detail="User not found")
+        conn.commit()
+
+    return {
+        "updated": True,
+        "username": new_username,
+        "access_token": create_token(user_id, new_username),
+        "token_type": "bearer",
+    }
 
 class CategoryOut(BaseModel):
     id: int
